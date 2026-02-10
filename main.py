@@ -201,19 +201,20 @@ class SmallUNet(nn.Module):
         self.emb_head = nn.Conv2d(32, emb_dim, 1)
 
     @staticmethod
-    def _crop_like(src, tgt):
-        """
-        Crop src (B,C,H,W) to spatial size of tgt (B,C,h,w)
-        """
-        _, _, H, W = src.shape
-        _, _, h, w = tgt.shape
-        if H == h and W == w:
-            return src
-        dh = H - h
-        dw = W - w
-        top = dh // 2
-        left = dw // 2
-        return src[:, :, top:top+h, left:left+w]
+    def _match_spatial(a, b):
+        # a,b: (B,C,H,W) -> crop to min(H,W) around center
+        Ha, Wa = a.shape[-2:]
+        Hb, Wb = b.shape[-2:]
+        h = min(Ha, Hb)
+        w = min(Wa, Wb)
+
+        def center_crop(x, h, w):
+            H, W = x.shape[-2:]
+            top = (H - h) // 2
+            left = (W - w) // 2
+            return x[:, :, top:top+h, left:left+w]
+
+        return center_crop(a, h, w), center_crop(b, h, w)
 
     def forward(self, x):
         d1 = self.down1(x)          # (B,32,H,W)
@@ -222,11 +223,11 @@ class SmallUNet(nn.Module):
         m  = self.mid(self.pool2(d2))     # (B,128,H/4,W/4)
 
         u2 = self.up2(m)            # (B,64,~H/2,~W/2)
-        d2c = self._crop_like(d2, u2)
+        u2, d2c = self._match_spatial(u2, d2)
         x2 = self.dec2(torch.cat([u2, d2c], dim=1))
 
         u1 = self.up1(x2)           # (B,32,~H,~W)
-        d1c = self._crop_like(d1, u1)
+        u1, d1c = self._match_spatial(u1, d1)
         x1 = self.dec1(torch.cat([u1, d1c], dim=1))
 
         emb = self.emb_head(x1)     # (B,emb_dim,H,W) (примерно, после crop совпадает)
