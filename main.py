@@ -37,6 +37,7 @@ def parse_args():
     p.add_argument("--line_category_id", type=int, default=2)
 
     p.add_argument("--max_steps", type=int, default=0, help="0 = full epoch; else limit steps per epoch")
+    p.add_argument("--amp", action="store_true", help="enable mixed precision (CUDA only)")
     return p.parse_args()
 
 def pad_to(x, H, W, pad_value=0):
@@ -284,17 +285,18 @@ def load_ckpt(path, model, opt=None, device="cpu"):
     return start_epoch, best_val
 
 @torch.no_grad()
-def eval_val_loss(model, dl_val, device):
+def eval_val_loss(model, dl_val, device, use_amp=False):
     model.eval()
     total = 0.0
     n = 0
     for img, inst, valid, _ in dl_val:
         img = img.to(device); inst = inst.to(device); valid = valid.to(device)
-        emb = model(img)
-        h, w = emb.shape[-2], emb.shape[-1]
-        inst  = inst[:, :h, :w]
-        valid = valid[:, :h, :w]
-        loss = discriminative_loss(emb, inst, valid)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            emb = model(img)
+            h, w = emb.shape[-2], emb.shape[-1]
+            inst  = inst[:, :h, :w]
+            valid = valid[:, :h, :w]
+            loss = discriminative_loss(emb, inst, valid)
         total += float(loss.item())
         n += 1
     model.train()
@@ -327,8 +329,12 @@ def main():
     print("len(dl) steps/epoch =", len(dl))
 
     # model
-    model = SmallUNet(in_ch=3, emb_dim=8).to(device)
+    model = SmallUNet(in_ch=3, emb_dim=16).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    use_amp = bool(args.amp and device == "cuda")
+    if args.amp and not use_amp:
+        print("AMP requested, but CUDA is unavailable. Running in FP32.")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # resume
     start_epoch = 1
@@ -350,16 +356,18 @@ def main():
         for step, (img, inst, valid, _) in enumerate(dl, start=1):
             img = img.to(device); inst = inst.to(device); valid = valid.to(device)
 
-            emb = model(img)
-            h, w = emb.shape[-2], emb.shape[-1]
-            inst  = inst[:, :h, :w]
-            valid = valid[:, :h, :w]
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                emb = model(img)
+                h, w = emb.shape[-2], emb.shape[-1]
+                inst  = inst[:, :h, :w]
+                valid = valid[:, :h, :w]
 
-            loss = discriminative_loss(emb, inst, valid)
+                loss = discriminative_loss(emb, inst, valid)
 
             opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
 
             total += float(loss.item())
             steps_done = step
@@ -379,7 +387,7 @@ def main():
 
         # --- eval & save best ---
         if epoch % args.eval_every == 0:
-            val_loss = eval_val_loss(model, dl_val, device)
+            val_loss = eval_val_loss(model, dl_val, device, use_amp=use_amp)
             print(f"epoch {epoch} val_loss={val_loss:.4f}")
 
             if (best_val is None) or (val_loss < best_val):
