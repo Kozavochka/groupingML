@@ -8,7 +8,7 @@ import torch
 from sklearn.cluster import DBSCAN
 from sklearn.neighbors import NearestNeighbors
 
-from main import SmallUNet
+from model import SmallUNet
 
 
 PALETTE_BGR = [
@@ -43,6 +43,8 @@ def parse_args():
     p.add_argument("--auto_eps", action="store_true", help="Use per-image eps from kNN distances.")
     p.add_argument("--auto_eps_k", type=int, default=10)
     p.add_argument("--auto_eps_q", type=float, default=0.90)
+    p.add_argument("--use_spatial", action="store_true", help="Append normalized (x,y) to embedding features.")
+    p.add_argument("--spatial_weight", type=float, default=0.15, help="Weight for normalized (x,y) features.")
 
     return p.parse_args()
 
@@ -116,7 +118,16 @@ def auto_eps_knn(feats, k=10, q=0.90):
 
 
 def cluster_points_by_embedding(
-    emb, coords_xy, eps=0.3, min_samples=20, l2_normalize=True, auto_eps=False, auto_eps_k=10, auto_eps_q=0.90
+    emb,
+    coords_xy,
+    eps=0.3,
+    min_samples=20,
+    l2_normalize=True,
+    auto_eps=False,
+    auto_eps_k=10,
+    auto_eps_q=0.90,
+    use_spatial=False,
+    spatial_weight=0.15,
 ):
     """
     emb: (D, h, w)
@@ -139,13 +150,22 @@ def cluster_points_by_embedding(
 
     xs = coords_used[:, 0]
     ys = coords_used[:, 1]
-    feats = emb[:, ys, xs].T
+    feats = emb[:, ys, xs].T.astype(np.float32)
 
     if l2_normalize:
         feats = feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-8)
 
-    eps_used = auto_eps_knn(feats, k=auto_eps_k, q=auto_eps_q) if auto_eps else float(eps)
-    labels = DBSCAN(eps=eps_used, min_samples=min_samples).fit(feats).labels_.astype(np.int32)
+    feats_cluster = feats
+    if use_spatial:
+        # Normalize pixel coords to [0,1], center to roughly match zero-centered embeddings.
+        xyn = coords_used.astype(np.float32).copy()
+        xyn[:, 0] = xyn[:, 0] / max(1.0, float(w - 1))
+        xyn[:, 1] = xyn[:, 1] / max(1.0, float(h - 1))
+        xyn = xyn - 0.5
+        feats_cluster = np.concatenate([feats, float(spatial_weight) * xyn], axis=1)
+
+    eps_used = auto_eps_knn(feats_cluster, k=auto_eps_k, q=auto_eps_q) if auto_eps else float(eps)
+    labels = DBSCAN(eps=eps_used, min_samples=min_samples).fit(feats_cluster).labels_.astype(np.int32)
     return labels, coords_used, eps_used
 
 
@@ -231,6 +251,8 @@ def main():
             auto_eps=args.auto_eps,
             auto_eps_k=args.auto_eps_k,
             auto_eps_q=args.auto_eps_q,
+            use_spatial=args.use_spatial,
+            spatial_weight=args.spatial_weight,
         )
 
         labels_remap = remap_clusters(labels)
@@ -251,6 +273,8 @@ def main():
                 "auto_eps": bool(args.auto_eps),
                 "auto_eps_k": int(args.auto_eps_k),
                 "auto_eps_q": float(args.auto_eps_q),
+                "use_spatial": bool(args.use_spatial),
+                "spatial_weight": float(args.spatial_weight),
             },
         }
 

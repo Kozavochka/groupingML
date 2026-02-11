@@ -130,3 +130,73 @@ python main.py \
 - `scikit-learn`
 - `matplotlib` (опционально для визуализации)
 
+## API (FastAPI)
+
+Добавлен API-сервис для инференса и кластеризации по входному изображению:
+
+- `POST /v1/cluster`
+- `GET /health`
+- `GET /model/info`
+
+### Что возвращает `POST /v1/cluster`
+
+- `num_clusters` — количество кластеров;
+- `clusters` — словарь `cluster_id -> [[x, y], ...]`;
+- `cluster_pixel_values` — словарь `cluster_id -> [[r, g, b], ...]`;
+- `noise` — точки, помеченные DBSCAN как шум;
+- `meta` — служебная информация и использованные параметры.
+
+### Параметры метода
+
+Параметры передаются в body как `multipart/form-data` вместе с файлом:
+
+- файл: `file`
+- параметры модели/кластеризации:
+  - `eps`, `min_samples`, `l2_normalize`
+  - `auto_eps`, `auto_eps_k`, `auto_eps_q`
+  - `use_spatial`, `spatial_weight`
+- параметры выбора candidate-пикселей:
+  - `candidate_method` (`non_white` | `canny` | `all_pixels`)
+  - `white_threshold`
+  - `canny_threshold1`, `canny_threshold2`, `canny_aperture_size`, `canny_l2gradient`, `canny_dilate_iter`
+  - `max_candidate_points`
+
+### Установка зависимостей для API
+
+```bash
+pip install -r requirements_api.txt
+```
+
+### Конфигурация через `.env`
+
+Добавьте/обновите `.env` в корне проекта:
+
+```env
+MODEL_CHECKPOINT_PATH=artifacts/ckpt_best.pt
+MODEL_EMB_DIM=16
+MODEL_DEVICE=
+API_AUTH_ENABLED=true
+API_AUTH_USERNAME=admin
+API_AUTH_PASSWORD=change_me
+MAX_UPLOAD_BYTES=10485760
+```
+
+### Запуск API
+
+```bash
+uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+### Пример запроса
+
+```bash
+curl -X POST "http://127.0.0.1:8000/v1/cluster" \
+  -u "admin:change_me" \
+  -F "file=@/path/to/image.png" \
+  -F "eps=0.3" \
+  -F "min_samples=20" \
+  -F "candidate_method=non_white" \
+  -F "white_threshold=245"
+```
+
+Если `API_AUTH_ENABLED=true`, метод `POST /v1/cluster` защищен Basic Auth.

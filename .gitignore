@@ -1,1 +1,32 @@
-/line_data
+# Data
+/line_data/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python cache/build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Model artifacts and checkpoints
+artifacts/*.pt
+artifacts/*.pth
+artifacts/*.ckpt
+checkpoints/
+
+# Runtime/generated outputs
+outputs/
+logs/
+*.log
