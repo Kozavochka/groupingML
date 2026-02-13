@@ -7,6 +7,10 @@ import numpy as np
 import torch
 from sklearn.cluster import DBSCAN
 from sklearn.neighbors import NearestNeighbors
+try:
+    from hdbscan import HDBSCAN
+except Exception:  # pragma: no cover - optional dependency
+    HDBSCAN = None
 
 from config import settings
 from inference.candidates import extract_candidate_coords
@@ -15,14 +19,16 @@ from model import SmallUNet
 
 @dataclass
 class ClusterParams:
+    clustering_method: str = "hdbscan"
     eps: float = 0.3
-    min_samples: int = 20
+    min_samples: int = 12
     l2_normalize: bool = True
     auto_eps: bool = False
     auto_eps_k: int = 10
     auto_eps_q: float = 0.90
-    use_spatial: bool = False
-    spatial_weight: float = 0.15
+    use_spatial: bool = True
+    spatial_weight: float = 0.25
+    adaptive_min_samples: bool = True
 
     candidate_method: str = "non_white"
     white_threshold: int = 245
@@ -46,21 +52,43 @@ def auto_eps_knn(feats: np.ndarray, k: int = 10, q: float = 0.90) -> float:
     return max(eps, 1e-6)
 
 
+def adaptive_min_samples(base: int, n_points: int, enabled: bool = True) -> int:
+    if not enabled:
+        return max(1, int(base))
+    # Keep clustering stable across sparse/dense candidate sets without dropping points.
+    base = max(1, int(base))
+    n_points = max(1, int(n_points))
+    est = int(round(np.sqrt(n_points) * 0.7))
+    return max(2, min(max(base, est), 32))
+
+
 def _cluster_points_by_embedding(
     emb: np.ndarray,
     coords_xy: np.ndarray,
     params: ClusterParams,
-) -> tuple[np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray, float, int, str]:
     _, h, w = emb.shape
     if len(coords_xy) == 0:
-        return np.zeros((0,), dtype=np.int32), coords_xy, float(params.eps)
+        return (
+            np.zeros((0,), dtype=np.int32),
+            coords_xy,
+            float(params.eps),
+            int(params.min_samples),
+            str(params.clustering_method).strip().lower(),
+        )
 
     xs = coords_xy[:, 0]
     ys = coords_xy[:, 1]
     ok = (xs >= 0) & (ys >= 0) & (xs < w) & (ys < h)
     coords_used = coords_xy[ok]
     if len(coords_used) == 0:
-        return np.zeros((0,), dtype=np.int32), coords_used, float(params.eps)
+        return (
+            np.zeros((0,), dtype=np.int32),
+            coords_used,
+            float(params.eps),
+            int(params.min_samples),
+            str(params.clustering_method).strip().lower(),
+        )
 
     xs = coords_used[:, 0]
     ys = coords_used[:, 1]
@@ -82,8 +110,34 @@ def _cluster_points_by_embedding(
         if params.auto_eps
         else float(params.eps)
     )
-    labels = DBSCAN(eps=eps_used, min_samples=int(params.min_samples)).fit(feats_cluster).labels_.astype(np.int32)
-    return labels, coords_used, float(eps_used)
+    min_samples_used = adaptive_min_samples(
+        base=int(params.min_samples),
+        n_points=len(coords_used),
+        enabled=bool(params.adaptive_min_samples),
+    )
+    method = str(params.clustering_method).strip().lower()
+    method_used = method
+    if method == "dbscan":
+        labels = DBSCAN(eps=eps_used, min_samples=min_samples_used).fit(feats_cluster).labels_.astype(np.int32)
+    elif method == "hdbscan":
+        if HDBSCAN is None:
+            # Fallback keeps endpoint functional even if optional dependency is missing.
+            labels = DBSCAN(eps=eps_used, min_samples=min_samples_used).fit(feats_cluster).labels_.astype(np.int32)
+            method_used = "dbscan_fallback_from_hdbscan"
+        else:
+            labels = (
+                HDBSCAN(
+                    min_cluster_size=max(2, min_samples_used),
+                    min_samples=max(1, min_samples_used),
+                    cluster_selection_epsilon=float(eps_used),
+                )
+                .fit(feats_cluster)
+                .labels_
+                .astype(np.int32)
+            )
+    else:
+        raise ValueError("Unsupported clustering_method. Use 'dbscan' or 'hdbscan'.")
+    return labels, coords_used, float(eps_used), int(min_samples_used), method_used
 
 
 def _remap_clusters(labels: np.ndarray) -> np.ndarray:
@@ -149,24 +203,39 @@ class InferenceService:
             raise ValueError("Invalid or unsupported image file")
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-    def predict(self, image_bytes: bytes, params: ClusterParams) -> dict[str, Any]:
+    def predict(
+        self,
+        image_bytes: bytes,
+        params: ClusterParams,
+        candidate_coords: np.ndarray | None = None,
+    ) -> dict[str, Any]:
         self._load_model()
         rgb = self._decode_image(image_bytes)
         emb = self._embedding_map(rgb)
 
-        coords = extract_candidate_coords(
-            rgb=rgb,
-            method=params.candidate_method,
-            white_threshold=params.white_threshold,
-            canny_threshold1=params.canny_threshold1,
-            canny_threshold2=params.canny_threshold2,
-            canny_aperture_size=params.canny_aperture_size,
-            canny_l2gradient=params.canny_l2gradient,
-            canny_dilate_iter=params.canny_dilate_iter,
-            max_candidate_points=params.max_candidate_points,
-        )
+        if candidate_coords is None:
+            coords = extract_candidate_coords(
+                rgb=rgb,
+                method=params.candidate_method,
+                white_threshold=params.white_threshold,
+                canny_threshold1=params.canny_threshold1,
+                canny_threshold2=params.canny_threshold2,
+                canny_aperture_size=params.canny_aperture_size,
+                canny_l2gradient=params.canny_l2gradient,
+                canny_dilate_iter=params.canny_dilate_iter,
+                max_candidate_points=params.max_candidate_points,
+            )
+        else:
+            coords = np.asarray(candidate_coords, dtype=np.int32)
+            if int(params.max_candidate_points) > 0 and len(coords) > int(params.max_candidate_points):
+                idx = np.random.choice(len(coords), size=int(params.max_candidate_points), replace=False)
+                coords = coords[idx]
 
-        labels, coords_used, eps_used = _cluster_points_by_embedding(emb=emb, coords_xy=coords, params=params)
+        labels, coords_used, eps_used, min_samples_used, method_used = _cluster_points_by_embedding(
+            emb=emb,
+            coords_xy=coords,
+            params=params,
+        )
         labels_remap = _remap_clusters(labels)
         clusters = _build_clusters(coords_used=coords_used, labels_remap=labels_remap)
         cluster_pixel_values = _build_cluster_pixels(rgb=rgb, coords_used=coords_used, labels_remap=labels_remap)
@@ -187,6 +256,8 @@ class InferenceService:
                 "used_points": int(len(coords_used)),
                 "noise_points": int(np.sum(labels_remap == -1)),
                 "eps_used": float(eps_used),
+                "min_samples_used": int(min_samples_used),
+                "clustering_method_used": str(method_used),
                 "image_height": int(rgb.shape[0]),
                 "image_width": int(rgb.shape[1]),
                 "params": asdict(params),

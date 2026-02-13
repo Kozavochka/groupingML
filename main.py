@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from sklearn.cluster import DBSCAN
+from sklearn.metrics import adjusted_rand_score
 
 from model import SmallUNet
 
@@ -35,6 +37,24 @@ def parse_args():
 
     p.add_argument("--max_steps", type=int, default=0, help="0 = full epoch; else limit steps per epoch")
     p.add_argument("--amp", action="store_true", help="enable mixed precision (CUDA only)")
+    p.add_argument("--seed", type=int, default=42)
+
+    # Discriminative loss hyperparameters.
+    p.add_argument("--delta_v", type=float, default=0.5)
+    p.add_argument("--delta_d", type=float, default=1.5)
+    p.add_argument("--w_var", type=float, default=1.0)
+    p.add_argument("--w_dist", type=float, default=1.0)
+    p.add_argument("--w_reg", type=float, default=0.001)
+
+    # Validation clustering metrics.
+    p.add_argument("--disable_val_metrics", action="store_true")
+    p.add_argument("--val_metric_eps", type=float, default=0.5)
+    p.add_argument("--val_metric_min_samples", type=int, default=6)
+    p.add_argument("--val_metric_max_points", type=int, default=6000)
+    p.add_argument("--val_metric_pair_samples", type=int, default=20000)
+
+    # Which metric defines "best checkpoint".
+    p.add_argument("--best_metric", choices=["val_loss", "val_pair_f1"], default="val_loss")
     return p.parse_args()
 
 def pad_to(x, H, W, pad_value=0):
@@ -221,10 +241,98 @@ def load_ckpt(path, model, opt=None, device="cpu"):
     return start_epoch, best_val
 
 @torch.no_grad()
-def eval_val_loss(model, dl_val, device, use_amp=False):
+def _pair_f1_from_sampled_pairs(gt_labels, pred_labels, num_pairs, rng):
+    n = int(len(gt_labels))
+    if n < 2 or num_pairs <= 0:
+        return float("nan")
+
+    i = rng.integers(0, n, size=int(num_pairs), dtype=np.int64)
+    j = rng.integers(0, n, size=int(num_pairs), dtype=np.int64)
+    same = i == j
+    while np.any(same):
+        j[same] = rng.integers(0, n, size=int(np.sum(same)), dtype=np.int64)
+        same = i == j
+
+    gt_same = gt_labels[i] == gt_labels[j]
+    pred_same = (pred_labels[i] == pred_labels[j]) & (pred_labels[i] != -1)
+
+    positives = int(np.sum(gt_same))
+    if positives == 0:
+        return float("nan")
+
+    tp = int(np.sum(gt_same & pred_same))
+    fp = int(np.sum((~gt_same) & pred_same))
+    fn = int(np.sum(gt_same & (~pred_same)))
+    denom = (2 * tp + fp + fn)
+    if denom == 0:
+        return float("nan")
+    return float((2 * tp) / denom)
+
+
+@torch.no_grad()
+def _sample_grouping_metrics(
+    emb_sample: np.ndarray,
+    inst_sample: np.ndarray,
+    valid_sample: np.ndarray,
+    metric_eps: float,
+    metric_min_samples: int,
+    metric_max_points: int,
+    metric_pair_samples: int,
+    rng,
+):
+    line_mask = (valid_sample > 0) & (inst_sample > 0)
+    ys, xs = np.nonzero(line_mask)
+    if len(xs) < 2:
+        return None
+
+    gt_labels = inst_sample[ys, xs].astype(np.int32, copy=False)
+    if metric_max_points > 0 and len(xs) > metric_max_points:
+        idx = rng.choice(len(xs), size=int(metric_max_points), replace=False)
+        ys = ys[idx]
+        xs = xs[idx]
+        gt_labels = gt_labels[idx]
+
+    feats = emb_sample[:, ys, xs].T.astype(np.float32, copy=False)
+    feats = feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-8)
+
+    min_samples = max(2, int(metric_min_samples))
+    labels = DBSCAN(eps=float(metric_eps), min_samples=min_samples).fit(feats).labels_.astype(np.int32)
+
+    ari = float(adjusted_rand_score(gt_labels, labels))
+    pair_f1 = _pair_f1_from_sampled_pairs(gt_labels, labels, metric_pair_samples, rng)
+
+    gt_num = int(np.unique(gt_labels).shape[0])
+    pred_num = int(np.unique(labels[labels != -1]).shape[0]) if np.any(labels != -1) else 0
+    count_mae = float(abs(pred_num - gt_num))
+    noise_ratio = float(np.mean(labels == -1))
+
+    return {
+        "ari": ari,
+        "pair_f1": pair_f1,
+        "cluster_count_mae": count_mae,
+        "noise_ratio": noise_ratio,
+    }
+
+
+@torch.no_grad()
+def eval_val(
+    model,
+    dl_val,
+    device,
+    use_amp=False,
+    loss_kwargs=None,
+    metric_cfg=None,
+):
     model.eval()
+    loss_kwargs = loss_kwargs or {}
+
     total = 0.0
     n = 0
+    metric_keys = ["ari", "pair_f1", "cluster_count_mae", "noise_ratio"]
+    metric_values = {k: [] for k in metric_keys}
+    metric_samples = 0
+    rng = np.random.default_rng(int(metric_cfg["seed"])) if metric_cfg is not None else None
+
     for img, inst, valid, _ in dl_val:
         img = img.to(device); inst = inst.to(device); valid = valid.to(device)
         with torch.amp.autocast("cuda", enabled=use_amp):
@@ -232,14 +340,47 @@ def eval_val_loss(model, dl_val, device, use_amp=False):
             h, w = emb.shape[-2], emb.shape[-1]
             inst  = inst[:, :h, :w]
             valid = valid[:, :h, :w]
-            loss = discriminative_loss(emb, inst, valid)
+            loss = discriminative_loss(emb, inst, valid, **loss_kwargs)
         total += float(loss.item())
         n += 1
+
+        if metric_cfg is not None:
+            emb_np = emb.detach().cpu().numpy()
+            inst_np = inst.detach().cpu().numpy()
+            valid_np = valid.detach().cpu().numpy()
+            for b in range(emb_np.shape[0]):
+                sample_m = _sample_grouping_metrics(
+                    emb_sample=emb_np[b],
+                    inst_sample=inst_np[b],
+                    valid_sample=valid_np[b],
+                    metric_eps=float(metric_cfg["eps"]),
+                    metric_min_samples=int(metric_cfg["min_samples"]),
+                    metric_max_points=int(metric_cfg["max_points"]),
+                    metric_pair_samples=int(metric_cfg["pair_samples"]),
+                    rng=rng,
+                )
+                if sample_m is None:
+                    continue
+                metric_samples += 1
+                for k in metric_keys:
+                    metric_values[k].append(sample_m[k])
+
     model.train()
-    return total / max(1, n)
+    out = {"val_loss": total / max(1, n)}
+    out["val_metric_samples"] = int(metric_samples)
+    for k in metric_keys:
+        vals = np.asarray(metric_values[k], dtype=np.float64)
+        out[f"val_{k}"] = float(np.nanmean(vals)) if vals.size > 0 else float("nan")
+    return out
 
 def main():
     args = parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     # device
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -272,6 +413,21 @@ def main():
         print("AMP requested, but CUDA is unavailable. Running in FP32.")
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
+    loss_kwargs = {
+        "delta_v": float(args.delta_v),
+        "delta_d": float(args.delta_d),
+        "w_var": float(args.w_var),
+        "w_dist": float(args.w_dist),
+        "w_reg": float(args.w_reg),
+    }
+    metric_cfg = None if args.disable_val_metrics else {
+        "eps": float(args.val_metric_eps),
+        "min_samples": int(args.val_metric_min_samples),
+        "max_points": int(args.val_metric_max_points),
+        "pair_samples": int(args.val_metric_pair_samples),
+        "seed": int(args.seed),
+    }
+
     # resume
     start_epoch = 1
     best_val = None
@@ -298,7 +454,7 @@ def main():
                 inst  = inst[:, :h, :w]
                 valid = valid[:, :h, :w]
 
-                loss = discriminative_loss(emb, inst, valid)
+                loss = discriminative_loss(emb, inst, valid, **loss_kwargs)
 
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -323,13 +479,44 @@ def main():
 
         # --- eval & save best ---
         if epoch % args.eval_every == 0:
-            val_loss = eval_val_loss(model, dl_val, device, use_amp=use_amp)
-            print(f"epoch {epoch} val_loss={val_loss:.4f}")
+            val_stats = eval_val(
+                model=model,
+                dl_val=dl_val,
+                device=device,
+                use_amp=use_amp,
+                loss_kwargs=loss_kwargs,
+                metric_cfg=metric_cfg,
+            )
+            val_loss = float(val_stats["val_loss"])
+            val_ari = float(val_stats["val_ari"])
+            val_pair_f1 = float(val_stats["val_pair_f1"])
+            val_count_mae = float(val_stats["val_cluster_count_mae"])
+            val_noise_ratio = float(val_stats["val_noise_ratio"])
+            val_metric_samples = int(val_stats["val_metric_samples"])
 
-            if (best_val is None) or (val_loss < best_val):
-                best_val = val_loss
+            print(
+                f"epoch {epoch} val_loss={val_loss:.4f} "
+                f"val_ari={val_ari:.4f} "
+                f"val_pair_f1={val_pair_f1:.4f} "
+                f"val_cluster_count_mae={val_count_mae:.4f} "
+                f"val_noise_ratio={val_noise_ratio:.4f} "
+                f"metric_samples={val_metric_samples}"
+            )
+
+            if args.best_metric == "val_pair_f1":
+                score = val_pair_f1
+                better = np.isfinite(score) and ((best_val is None) or (score > best_val))
+            else:
+                score = val_loss
+                better = (best_val is None) or (score < best_val)
+
+            if better:
+                best_val = score
                 save_ckpt(save_dir / "ckpt_best.pt", model, opt, epoch, best_val=best_val)
-                print(f"Saved BEST -> {save_dir/'ckpt_best.pt'} (best_val={best_val:.4f})")
+                print(
+                    f"Saved BEST -> {save_dir/'ckpt_best.pt'} "
+                    f"(best_metric={args.best_metric}, best_val={best_val:.4f})"
+                )
 
     # финальный сейв на всякий
     save_ckpt(save_dir / "ckpt_final.pt", model, opt, args.epochs, best_val=best_val)

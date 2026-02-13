@@ -4,6 +4,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from config import settings
+from inference.markup import parse_chartreader_markup
 from inference.service import ClusterParams, InferenceService
 
 
@@ -49,14 +50,18 @@ def model_info() -> dict[str, str | int]:
 async def cluster_image(
     _: str = Depends(require_basic_auth),
     file: UploadFile = File(...),
+    markup: str | None = Form(None),
+    score_thr: float = Form(0.4),
+    category_idx: int = Form(0),
+    clustering_method: str = Form("hdbscan"),
     eps: float = Form(0.3),
-    min_samples: int = Form(20),
+    min_samples: int = Form(12),
     l2_normalize: bool = Form(True),
     auto_eps: bool = Form(False),
     auto_eps_k: int = Form(10),
     auto_eps_q: float = Form(0.90),
-    use_spatial: bool = Form(False),
-    spatial_weight: float = Form(0.15),
+    use_spatial: bool = Form(True),
+    spatial_weight: float = Form(0.25),
     candidate_method: str = Form("non_white"),
     white_threshold: int = Form(245),
     canny_threshold1: int = Form(80),
@@ -76,6 +81,7 @@ async def cluster_image(
         )
 
     params = ClusterParams(
+        clustering_method=clustering_method,
         eps=eps,
         min_samples=min_samples,
         l2_normalize=l2_normalize,
@@ -93,9 +99,34 @@ async def cluster_image(
         canny_dilate_iter=canny_dilate_iter,
         max_candidate_points=max_candidate_points,
     )
+    markup_provided = bool(markup and markup.strip())
+    candidate_coords = parse_chartreader_markup(
+        markup_raw=markup,
+        score_thr=score_thr,
+        category_idx=category_idx,
+        target_image_name=file.filename,
+    )
+    used_markup = len(candidate_coords) > 0
+    fallback_reason = None
+    if markup_provided and not used_markup:
+        fallback_reason = "markup_empty_or_unparsed_after_score_filter"
 
     try:
-        return service.predict(image_bytes=raw, params=params)
+        # If markup is provided and parsed successfully, use those candidates.
+        # Otherwise fallback to candidate_method-based extraction.
+        coords = candidate_coords if used_markup else None
+        result = service.predict(image_bytes=raw, params=params, candidate_coords=coords)
+        result.setdefault("meta", {})
+        result["meta"].update(
+            {
+                "candidate_source": "markup" if used_markup else "candidate_method",
+                "markup_provided": bool(markup_provided),
+                "markup_points_after_score_thr": int(len(candidate_coords)),
+                "requested_file_name": str(file.filename),
+                "fallback_reason": fallback_reason,
+            }
+        )
+        return result
     except FileNotFoundError as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     except ValueError as e:

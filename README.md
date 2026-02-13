@@ -128,6 +128,7 @@ python main.py \
 - `numpy`
 - `opencv-python`
 - `scikit-learn`
+- `hdbscan` (опционально, если `clustering_method=hdbscan`)
 - `matplotlib` (опционально для визуализации)
 
 ## API (FastAPI)
@@ -143,7 +144,7 @@ python main.py \
 - `num_clusters` — количество кластеров;
 - `clusters` — словарь `cluster_id -> [[x, y], ...]`;
 - `cluster_pixel_values` — словарь `cluster_id -> [[r, g, b], ...]`;
-- `noise` — точки, помеченные DBSCAN как шум;
+- `noise` — точки, помеченные алгоритмом кластеризации как шум;
 - `meta` — служебная информация и использованные параметры.
 
 ### Параметры метода
@@ -152,6 +153,7 @@ python main.py \
 
 - файл: `file`
 - параметры модели/кластеризации:
+  - `clustering_method` (`dbscan` | `hdbscan`)
   - `eps`, `min_samples`, `l2_normalize`
   - `auto_eps`, `auto_eps_k`, `auto_eps_q`
   - `use_spatial`, `spatial_weight`
@@ -193,6 +195,7 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 curl -X POST "http://127.0.0.1:8000/v1/cluster" \
   -u "admin:change_me" \
   -F "file=@/path/to/image.png" \
+  -F "clustering_method=dbscan" \
   -F "eps=0.3" \
   -F "min_samples=20" \
   -F "candidate_method=non_white" \
